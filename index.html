@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>이미지 북마크</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        .drag-area {
+            border: 2px dashed #4b4b4b;
+            transition: all 0.3s ease;
+        }
+        .drag-area.active {
+            border-color: #6b6b6b;
+            background-color: #2a2a2a;
+        }
+        .image-card {
+            position: relative;
+            transition: transform 0.2s ease-in-out;
+        }
+        .image-card:hover {
+            transform: translateY(-5px);
+        }
+    </style>
+</head>
+<body class="bg-[#1a1a1a] min-h-screen flex items-center justify-center p-4">
+
+    <!-- 상단 고정: 로그인 바 -->
+    <div class="fixed top-3 left-1/2 -translate-x-1/2 z-50 w-[min(1100px,95vw)]">
+        <div class="flex items-center justify-between rounded-xl px-4 py-2 bg-[#2a2a2a]/80 backdrop-blur border border-[#3c3c3c]">
+            <div class="text-sm text-[#ababab]">
+                <span id="auth-state">로그아웃됨</span>
+            </div>
+            <div class="flex gap-2">
+                <button id="btn-google" class="px-3 py-1.5 rounded-md bg-white text-gray-900 text-sm font-medium hover:bg-gray-100">Google 로그인</button>
+                <button id="btn-anon" class="px-3 py-1.5 rounded-md bg-[#424242] text-white text-sm font-medium hover:bg-[#525252]">익명 로그인</button>
+                <button id="btn-logout" class="px-3 py-1.5 rounded-md bg-[#424242] text-white text-sm font-medium hover:bg-[#525252] hidden">로그아웃</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 로딩 오버레이 -->
+    <div id="loading-overlay" class="fixed inset-0 bg-[#1a1a1a] bg-opacity-70 z-40 flex items-center justify-center hidden">
+        <div class="flex flex-col items-center">
+            <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-white"></div>
+            <p class="text-white mt-4 text-lg">데이터를 불러오는 중...</p>
+        </div>
+    </div>
+
+    <!-- 본문 카드 -->
+    <main class="bg-[#242424] rounded-xl p-6 w-full max-w-4xl mx-auto flex flex-col space-y-6 mt-12">
+        <header class="text-center">
+            <h1 class="text-white text-2xl font-semibold">이미지 북마크</h1>
+            <p class="text-[#b3b3b3] text-sm mt-1">이미지를 드래그&드롭하거나 이미지 URL을 끌어다 놓으세요.</p>
+        </header>
+
+        <section id="drag-area" class="drag-area rounded-lg p-8 flex items-center justify-center text-center text-[#999999] font-medium cursor-pointer">
+            <div>
+                <p class="text-base">여기로 <span class="text-white font-semibold">이미지</span>를 드래그하세요</p>
+                <p class="text-xs mt-1 text-[#666666]">파일 업로드는 지원하지 않습니다. 웹의 이미지 또는 이미지 URL만 저장됩니다.</p>
+            </div>
+        </section>
+
+        <section id="image-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 mt-2"></section>
+
+        <!-- 경고 모달 -->
+        <div id="alert-modal" class="fixed inset-0 bg-[#1a1a1a] bg-opacity-50 flex items-center justify-center hidden z-50">
+            <div class="bg-[#242424] rounded-lg p-6 shadow-xl max-w-sm mx-auto">
+                <p id="modal-message" class="text-white text-lg text-center font-medium"></p>
+                <div class="mt-4 flex justify-center">
+                    <button id="modal-close-btn" class="px-4 py-2 bg-[#424242] text-white rounded-md hover:bg-[#525252] focus:outline-none">확인</button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import {
+            getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged,
+            GoogleAuthProvider, signInWithPopup, signOut
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import {
+            getFirestore, collection, onSnapshot, addDoc, deleteDoc, doc,
+            query, orderBy, serverTimestamp
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId, unsubscribeImages = null;
+
+        // UI
+        const dragArea = document.getElementById('drag-area');
+        const imageGrid = document.getElementById('image-grid');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const alertModal = document.getElementById('alert-modal');
+        const modalMessage = document.getElementById('modal-message');
+        const modalCloseBtn = document.getElementById('modal-close-btn');
+        const stateEl = document.getElementById('auth-state');
+        const btnGoogle = document.getElementById('btn-google');
+        const btnAnon = document.getElementById('btn-anon');
+        const btnLogout = document.getElementById('btn-logout');
+
+        function showLoading() { loadingOverlay.classList.remove('hidden'); }
+        function hideLoading() { loadingOverlay.classList.add('hidden'); }
+        function showAlert(msg) { modalMessage.textContent = msg; alertModal.classList.remove('hidden'); }
+        function hideAlert() { alertModal.classList.add('hidden'); }
+        modalCloseBtn.addEventListener('click', hideAlert);
+
+        async function initFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                // 로그인 상태 감시
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        stateEl.textContent = `로그인: ${user.isAnonymous ? '손님' : (user.displayName || user.email)}`;
+                        btnLogout.classList.remove('hidden');
+                        btnGoogle.classList.add('hidden');
+                        btnAnon.classList.add('hidden');
+                        setupRealtimeListener();
+                    } else {
+                        userId = undefined;
+                        stateEl.textContent = '로그아웃됨';
+                        btnLogout.classList.add('hidden');
+                        btnGoogle.classList.remove('hidden');
+                        btnAnon.classList.remove('hidden');
+                        if (unsubscribeImages) {
+                            unsubscribeImages();
+                            unsubscribeImages = null;
+                        }
+                        imageGrid.innerHTML = '';
+                    }
+                });
+
+                // 초깃값: 커스텀 토큰 제공 시 자동 로그인, 아니면 대기
+                if (initialAuthToken) {
+                    showLoading();
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    hideLoading();
+                }
+            } catch (err) {
+                console.error('Error initializing Firebase:', err);
+                showAlert('Firebase 초기화 오류. 콘솔을 확인하세요.');
+            }
+        }
+
+        function setupRealtimeListener() {
+            if (!db || !userId) return;
+            if (unsubscribeImages) {
+                unsubscribeImages();
+                unsubscribeImages = null;
+            }
+
+            const imagesRef = collection(db, `artifacts/${appId}/users/${userId}/images`);
+            const q = query(imagesRef, orderBy('timestamp', 'desc'));
+            unsubscribeImages = onSnapshot(q, (snapshot) => {
+                imageGrid.innerHTML = '';
+                if (snapshot.empty) return;
+
+                snapshot.forEach((d) => {
+                    const data = d.data();
+                    const imageUrl = data?.url;
+                    if (!imageUrl) return;
+                    const card = document.createElement('div');
+                    card.className = 'image-card relative group cursor-pointer';
+                    card.innerHTML = `
+                        <a href="${imageUrl}" target="_blank" class="block w-full h-full">
+                            <img src="${imageUrl}" alt="북마크된 이미지" class="w-full h-40 object-cover rounded-lg shadow-md"/>
+                        </a>
+                        <button class="absolute top-2 right-2 bg-[#424242] text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity" data-id="${d.id}">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                        </button>`;
+                    imageGrid.appendChild(card);
+                });
+
+                imageGrid.querySelectorAll('button[data-id]').forEach(btn => {
+                    btn.onclick = async (e) => {
+                        const id = e.currentTarget.dataset.id;
+                        try {
+                            await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/images`, id));
+                        } catch (err) {
+                            console.error(err);
+                            showAlert('이미지 삭제 중 오류가 발생했습니다.');
+                        }
+                    };
+                });
+            }, (error) => {
+                console.error('Realtime listener error:', error);
+                showAlert('이미지 데이터를 불러오는 중 오류가 발생했습니다.');
+            });
+        }
+
+        // 드래그&드롭
+        dragArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dragArea.classList.add('active');
+        });
+        dragArea.addEventListener('dragleave', () => {
+            dragArea.classList.remove('active');
+        });
+        dragArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dragArea.classList.remove('active');
+            const files = e.dataTransfer.files;
+            if (files?.length) {
+                const file = files[0];
+                if (file.type?.startsWith('image/')) showAlert('파일 업로드는 미지원입니다. 이미지 URL을 드래그하세요.');
+                else showAlert('유효한 이미지 파일을 드롭하세요.');
+                return;
+            }
+            const url = e.dataTransfer.getData('URL');
+            const html = e.dataTransfer.getData('text/html');
+            const parsed = new DOMParser().parseFromString(html || '', 'text/html');
+            const img = parsed.querySelector('img');
+
+            if (img?.src) {
+                addImage(img.src);
+            } else if (url) {
+                if (/\.(jpeg|jpg|gif|png|webp|svg)$/i.test(url)) addImage(url);
+                else showAlert('유효한 이미지 URL이 아닙니다.');
+            } else {
+                showAlert('이미지를 드래그하거나 유효한 이미지 URL을 드롭하세요.');
+            }
+        });
+
+        // 붙여넣기 제어
+        document.addEventListener('paste', (e) => {
+            const items = e.clipboardData?.items || [];
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].kind === 'file' && items[i].type.startsWith('image/')) {
+                    e.preventDefault();
+                    showAlert('캡처 이미지는 URL이 없어 저장 불가합니다. 웹에 올린 뒤 링크를 사용하세요.');
+                    break;
+                }
+            }
+        });
+
+        // 로그인 버튼
+        document.getElementById('btn-anon')?.addEventListener('click', async () => {
+            try {
+                await signInAnonymously(auth);
+            } catch (e) {
+                console.error(e);
+                showAlert('익명 로그인 실패');
+            }
+        });
+        document.getElementById('btn-google')?.addEventListener('click', async () => {
+            try {
+                await signInWithPopup(auth, new GoogleAuthProvider());
+            } catch (e) {
+                console.error(e);
+                showAlert('Google 로그인 실패');
+            }
+        });
+        document.getElementById('btn-logout')?.addEventListener('click', async () => {
+            try {
+                await signOut(auth);
+            } catch (e) {
+                console.error(e);
+                showAlert('로그아웃 실패');
+            }
+        });
+
+        // 시작
+        window.onload = initFirebase;
+    </script>
+</body>
+</html>
